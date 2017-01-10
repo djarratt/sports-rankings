@@ -1,0 +1,853 @@
+---
+title: "Jarratt NFL Rankings"
+#author: "Daniel Jarratt"
+output:
+  rmdformats::material:
+    highlight: kate
+    self_contained: no
+    code_folding: hide
+    thumbnails: true
+    gallery: true
+    fig_width: 4
+    fig_height: 4
+---
+
+```{r 1 install dependencies, include=FALSE, message=FALSE}
+# Welcome to Dan Jarratt's sports rankings. We're going to use MCMC sampling 
+# to infer sports team proficiencies. We'll also evaluate MCMC against several
+# other models.
+
+# R markdown and knitr are for output of your data pipeline into web or PDF
+# They're especially friendly in R Studio
+require(rmarkdown)
+require(rmdformats)
+require(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+
+# charts
+require(ggplot2)
+require(ggthemes)
+
+# data manipulation
+require(tidyr)
+require(dplyr)
+
+# rethinking is a wrapper for rstan, which you can get at 
+# http://xcelab.net/rm/software/ (not CRAN)
+require(rethinking)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores() - 1)
+
+# We want to evaluate against competitor algorithms
+require(PlayerRatings)
+require(glmnet)
+require(randomForest)
+```
+
+```{r 2 obtain data, include=FALSE, cache=TRUE}
+# Ken Massey runs an incredibly useful website at http://www.masseyratings.com.
+# He's been active in the sports ranking community for years and makes data
+# freely available to use. Ken also solicits others' rankings for inclusion in
+# his Composite Rankings.
+
+# We're going to get up-to-date scores from his site and transform them into a
+# format suitable for modeling, including rethinking and rstan.
+
+#### Prepare URLs ####
+
+URL_BASE = "http://www.masseyratings.com/scores.php?s="
+
+# Ken organizes sports and seasons using keys
+# Replace this key to get another sport or season
+THIS_SEASON_KEY = "286576"  # 2016-17 NFL season
+
+URL_PARAMS = "&all=1&mode=3&format="
+URL_FORMAT_GAMES = "1"
+URL_FORMAT_TEAMS = "2"
+
+COLUMNS_TEAMS = c("id_massey", "team")
+COLUMNS_GAMES = c("gameday","date","winner_id","winner_home","winner_score",
+                  "loser_id","loser_home","loser_score")
+
+# Let's build the 2 URLs we need
+url_teams = paste(URL_BASE, THIS_SEASON_KEY, URL_PARAMS, URL_FORMAT_TEAMS, 
+                  sep = "")
+url_games = paste(URL_BASE, THIS_SEASON_KEY, URL_PARAMS, URL_FORMAT_GAMES, 
+                  sep = "")
+
+
+#### Download data ####
+
+# Game scores are stored with team id values, not team names
+# So first we'll get the natural language names for each team
+teams = read.csv(url(url_teams), 
+                 header = FALSE,
+                 col.names = COLUMNS_TEAMS) %>%
+  mutate(team = gsub("_", " ", team))
+
+# Then we'll download all game data for this particular season
+games = read.csv(url(url_games), 
+                 header = FALSE, 
+                 col.names = COLUMNS_GAMES) %>%
+  mutate(
+    # Massey doesn't provide unique game id values in this file
+    # We can calculate row_number over the first column in this data frame
+    game_id = row_number(.[[1]]),
+    week_of_season = floor((gameday - min(gameday)) / 7) + 1
+  )
+
+#### Add game metadata ####
+
+# For predictive evaluation later, we need metadata of each game *before*
+# the game was played. In particular, wins and losses of each team before
+# each game.
+
+# Metadata step 1 of 3
+cumulative_results = games %>%
+  select(date, winner_id, loser_id, game_id) %>%
+  arrange(date) %>%
+  group_by(winner_id) %>%
+  mutate(winner_cumu_wins = row_number(game_id)) %>%
+  ungroup() %>%
+  group_by(loser_id) %>%
+  mutate(loser_cumu_losses = row_number(game_id)) %>%
+  ungroup()
+
+# Metadata step 2 of 3
+# get positive win/loss numbers; omits all 0's so we'll get those later
+# these results are AFTER each row's game is played
+positive_wl = cumulative_results %>%
+  full_join(cumulative_results, by = c("winner_id" = "loser_id")) %>%
+  filter(date.y <= date.x) %>%
+  select(game_id = game_id.x, date = date.x, winner_id, loser_id,
+         winner_cumu_wins = winner_cumu_wins.x, 
+         winner_cumu_losses = loser_cumu_losses.y,
+         loser_cumu_losses = loser_cumu_losses.x) %>%
+  group_by(game_id) %>%
+  arrange(desc(winner_cumu_losses)) %>%
+  slice(1) %>%
+  ungroup() %>%
+  full_join(cumulative_results, by = c("loser_id" = "winner_id")) %>%
+  filter(date.y <= date.x) %>%
+  select(game_id = game_id.x, date = date.x, winner_id, loser_id,
+         winner_cumu_wins = winner_cumu_wins.x, winner_cumu_losses,
+         loser_cumu_wins = winner_cumu_wins.y, 
+         loser_cumu_losses = loser_cumu_losses.x) %>%
+  group_by(game_id) %>%
+  arrange(desc(loser_cumu_wins)) %>%
+  slice(1) %>%
+  ungroup()
+
+# Metadata step 3 of 3
+# Final step to get win-loss records for each game before it was played
+games_with_cumu_prev_wl = cumulative_results %>%
+  left_join(positive_wl,
+            by = c("game_id", "date", "winner_id", "loser_id",
+                   "winner_cumu_wins", "loser_cumu_losses")) %>%
+  mutate(
+    # cumu means cumulative, i.e., AFTER this game was played, for summaries
+    # prev means previously, i.e., BEFORE this game was played, for prediction
+    winner_wins_cumu = ifelse(is.na(winner_cumu_wins), 0, winner_cumu_wins),
+    winner_wins_prev = winner_wins_cumu - 1,
+    winner_losses_cumu_prev = ifelse(is.na(winner_cumu_losses), 0,
+                                     winner_cumu_losses),    
+    loser_wins_cumu_prev = ifelse(is.na(loser_cumu_wins), 0, loser_cumu_wins),
+    loser_losses_cumu = ifelse(is.na(loser_cumu_losses), 0, loser_cumu_losses),
+    loser_losses_prev = loser_losses_cumu - 1,
+    winner_games_ahead_prev = ((winner_wins_prev - loser_wins_cumu_prev) +
+                            (loser_losses_prev - winner_losses_cumu_prev)) / 2
+  ) %>%
+  select(-winner_cumu_wins, -winner_cumu_losses, 
+         -loser_cumu_wins, -loser_cumu_losses)
+
+# Join newly-calculated metadata with original games data frame
+games_with_previous_wl = games %>%
+  left_join(games_with_cumu_prev_wl, by = c("date", "winner_id",
+                                            "loser_id", "game_id"))
+```
+
+
+```{r 3 modeling, eval=TRUE, cache=TRUE, include=FALSE}
+#### Evaluation method ####
+
+# Before using a model to estimate team strengths, we want to ensure that that
+# model has predictive power. We'll be using MCMC for our rankings, so we want
+# to evaluate its predictive power against competitor algorithms.
+# 
+# A common evaluation method is cross-evaluation. I recommend the caret package
+# for model evaluation. However, cross-evaluation isn't always optimal for
+# time series data (which football scores are). We want to design an evaluation
+# method that mimics how real predictions are made: each day or each week, for
+# the upcoming games.
+# 
+# Backtesting is an evaluation framework that "replays history", fitting
+# a model at each time t, predicting outcomes at time t+1, and scoring the
+# model on how well it predicted each time. It's not difficult to implement.
+
+# I'm going to start evaluation using five weeks of data instead of one.
+# This is because early in the season, it's important to use the previous
+# season's results to inform this season's predictions. I simply haven't done
+# enough evaluation to properly model this yet.
+weeks = 5:16
+MCMC = TRUE  # expensive; only turn on when you're ready
+
+# Empty data structure to hold predictions after they're made
+all_predictions = list()
+
+for (week in weeks) {
+  #### * Transform data for MCMC ####
+  
+  # Massey's source data, at least in the format we downloaded, is structured
+  # by a winner column and a loser column. That's fine for many algorithms,
+  # but rethinking has a particular constraint: we're going to model some group
+  # of Team A versus some group of Team B (perhaps home/away, or winner/loser,
+  # or other pairing), but *all teams must appear in both groups A and B*.
+  
+  # Pretend it's the first week of the season. Half of the teams haven't lost.
+  # and half of the teams haven't had a home game yet. We need a way to encode
+  # groups A and B so that every team appears in both groups.
+  
+  # Solution: take whatever our favorite grouping is, then *duplicate it* with
+  # group membership reversed. That is, we're going to put all winners into
+  # Group A and all losers into Group B. Then we'll duplicate the data, but
+  # with losers in Group A, winners in Group B, and the outcome variable
+  # flipped.
+  
+  # Another rethinking/stan constraint is that ID values have to be contiguous
+  # because they'll be used for array lookups. That is, if you have only two
+  # teams and they have id values 1 and 3, stan will store them in an array
+  # with indices 1 and 2. You have to be able to map from Ken Massey's id
+  # values to the rethinking index values. Pretend it's opening day in the NFL
+  # and only two teams have played, and they probably don't have Massey id 
+  # values 1 and 2.
+  
+  stan_massey_id_crosswalk = 
+    rbind(
+      games %>% select(id_massey = winner_id),
+      games %>% select(id_massey = loser_id)
+    ) %>%
+    unique()
+  stan_massey_id_crosswalk$id_stan =
+    coerce_index(stan_massey_id_crosswalk$id_massey)
+  
+  # A final constraint when using a binomial model is that outcomes must be 1
+  # of 2 values. But NFL teams can tie a game, and 0.5 has no meaning for these
+  # models. Solution: duplicate data yet again, once with outcome 0 and once
+  # with outcome 1 for both teams.
+  
+  # Desired columns for rethinking/stan:
+  ## Descriptive only
+  ### a_id_massey, b_id_massey = Massey's original id values
+  ## Predictors
+  ### a_id_stan, b_id_stan = contiguous ID values for team A and team B
+  ### a_hfa = flag for whether team A is home (1), neutral (0), or away (-1)
+  ## Outcomes
+  ### a_score_margin = final score margin for team A (i.e., losing by 10 = -10)
+  ### a_won_game = final win/loss outcome for team A (losing = 0, winning = 1)
+  
+  games_with_stan_ids = games_with_previous_wl %>%
+    # add stan id values
+    left_join(stan_massey_id_crosswalk, by = c("winner_id" = "id_massey")) %>%
+    rename(a_id_stan = id_stan, a_id_massey = winner_id) %>%
+    left_join(stan_massey_id_crosswalk, by = c("loser_id" = "id_massey")) %>%
+    rename(b_id_stan = id_stan, b_id_massey = loser_id) %>%
+    mutate(
+      a_losses_prev = winner_losses_cumu_prev,
+      b_wins_prev = loser_wins_cumu_prev
+    ) %>%
+    rename(a_hfa = winner_home, 
+           a_score = winner_score, b_score = loser_score,
+           a_wins_cumu = winner_wins_cumu,
+           a_wins_prev = winner_wins_prev,
+           a_losses_cumu = winner_losses_cumu_prev,
+           b_wins_cumu = loser_wins_cumu_prev,
+           b_losses_cumu = loser_losses_cumu,
+           b_losses_prev = loser_losses_prev,
+           a_games_ahead_prev = winner_games_ahead_prev) %>%
+    mutate(
+      a_score_margin = a_score - b_score,
+      a_won_game = ifelse(a_score_margin > 0, 1, 
+                          ifelse(a_score_margin == 0, 0.5, 0))
+    )
+  
+  # calculate win-loss records before duplicating games
+  # we'll use these records in the final rankings to show readers
+  records_a = games_with_stan_ids %>%
+    group_by(a_id_massey) %>%
+    summarise(played_a = n(), wins_a = sum(a_won_game)) %>%
+    ungroup()
+  records_b = games_with_stan_ids %>%
+    group_by(b_id_massey) %>%
+    summarise(played_b = n(), wins_b = sum(1 - a_won_game)) %>%
+    ungroup()
+  records = records_a %>%
+    full_join(records_b, by = c("a_id_massey" = "b_id_massey")) %>%
+    rename() %>%
+    mutate(
+      wins = ifelse(is.na(wins_a), 0, wins_a) +
+        ifelse(is.na(wins_b), 0, wins_b),
+      games = ifelse(is.na(played_a), 0, played_a) +
+        ifelse(is.na(played_b), 0, played_b),
+      losses = games - wins
+    ) %>%
+    select(id_massey = a_id_massey, wins, losses)
+  remove(records_a, records_b)
+  
+  # duplicate games to make rethinking/stan happy
+  games_duplicated = rbind(games_with_stan_ids,
+                           games_with_stan_ids %>%
+                             rename(a_id_stan = b_id_stan,
+                                    a_id_massey = b_id_massey,
+                                    b_id_stan = a_id_stan,
+                                    b_id_massey = a_id_massey,
+                                    a_score = b_score,
+                                    b_score = a_score,
+                                    a_wins_cumu = b_wins_cumu,
+                                    b_wins_cumu = a_wins_cumu,
+                                    a_wins_prev = b_wins_prev,
+                                    b_wins_prev = a_wins_prev,
+                                    a_losses_cumu = b_losses_cumu,
+                                    b_losses_cumu = a_losses_cumu,
+                                    a_losses_prev = b_losses_prev,
+                                    b_losses_prev = a_losses_prev) %>%
+                             mutate(a_hfa = a_hfa * -1,
+                                    a_games_ahead_prev = 
+                                      a_games_ahead_prev * -1,
+                                    a_score_margin = a_score_margin * -1,
+                                    a_won_game = ifelse(a_won_game == 0, 1, 0))
+                           ) %>%
+    # clean up
+    select(-gameday, -date, -a_score, -loser_home, -b_score)
+  
+  # now account for tie games
+  games_fully_transformed = rbind(
+    games_duplicated %>% filter(a_won_game != 0.5),
+    # duplicate the tie games
+    games_duplicated %>% filter(a_won_game == 0.5) %>% mutate(a_won_game = 0),
+    games_duplicated %>% filter(a_won_game == 0.5) %>% mutate(a_won_game = 1)
+  )
+  
+  #### * Transform data for ELO ####
+  games_for_elo_models = games_with_stan_ids %>%
+    filter(week_of_season <= week)
+  games_through_week = games_fully_transformed %>%
+    filter(week_of_season <= week)
+  
+  #### * Get set of games to predict ####
+  games_to_predict = games_with_stan_ids %>%
+    filter(week_of_season == (week + 1))
+  
+  #### * Create MCMC models ####
+  if (MCMC) {
+    # Here we specify mathematical models that describe the game data, and then
+    # rethinking and stan will estimate a distribution of likely values for
+    # each of the model elements. Comparing those likely values gives us 
+    # eventual team rankings and will also let us simulate games.
+    
+    # How many simulated games do you want to have for each team? 1000 is fast
+    # and 10,000 is more stable.
+    SAMPLE_COUNT = 1000
+    
+    # Model 1: predict a_score_margin
+    model_a_score_margin = map2stan(
+      # Predicting team A's margin of victory (positive) or loss (negative)
+      # Home field advantage is shared among all teams
+      # Team rating is specific to each team
+      alist(
+        a_score_margin ~ dnorm(mu_a_score_margin, sigma_a_score_margin),
+        
+        mu_a_score_margin <- noise + 
+          team[a_id_stan] - team[b_id_stan] + 
+          (hfa_league * a_hfa),
+        sigma_a_score_margin ~ dcauchy(0,10),
+        
+        noise ~ dnorm(28,14),
+        team[a_id_stan] ~ dnorm(0,14),
+        team[b_id_stan] ~ dnorm(0,14),
+        hfa_league ~ dnorm(3, league_hfa_sigma),
+        
+        league_hfa_sigma ~ dcauchy(0,5)
+      ), 
+      data = games_through_week, iter = 1000 + SAMPLE_COUNT,
+      warmup = 1000, refresh = 500)
+    
+    # Model 2: predict a_won_game
+    model_a_won_game = map2stan(
+      # Using Bernoulli processes, predicting team A's victory (1) or defeat (0)
+      # Home field advantage is shared among all teams
+      # Team rating is specific to each team
+      alist(
+        a_won_game ~ dbinom(1,p),
+        
+        logit(p) <- noise + 
+          team[a_id_stan] - team[b_id_stan] + 
+          (hfa_global * a_hfa),
+        
+        noise ~ dnorm(28,14),
+        team[a_id_stan] ~ dnorm(0,14),
+        team[b_id_stan] ~ dnorm(0,14),
+        hfa_global ~ dnorm(3, league_hfa_sigma),
+        
+        league_hfa_sigma ~ dcauchy(0,2.5)
+      ), 
+      data = games_through_week, iter = 1000 + SAMPLE_COUNT,
+      warmup = 1000, refresh = 500)
+    
+    PredictWinChance = function(a_id_stan, b_id_stan, a_hfa) {
+      return(mean(sim(fit = model_a_won_game, n = SAMPLE_COUNT,
+                      data = data_frame(a_id_stan = a_id_stan,
+                                        b_id_stan = b_id_stan,
+                                        a_hfa = a_hfa))))
+    }
+    PredictPointSpread = function(a_id_stan, b_id_stan, a_hfa) {
+      return(mean(sim(fit = model_a_score_margin, n = SAMPLE_COUNT,
+                      data = data_frame(a_id_stan = a_id_stan,
+                                        b_id_stan = b_id_stan,
+                                        a_hfa = a_hfa))))
+    }
+  }
+  
+  #### * Create ELO models ####
+  model_elo = elo(games_for_elo_models %>% select(date, 
+                                                  a_id_stan, 
+                                                  b_id_stan, 
+                                                  a_won_game),
+                  gamma = games_for_elo_models$a_hfa,
+                  kfac = 20 # per FiveThirtyEight
+                  )
+  model_fide = fide(games_for_elo_models %>% select(date, 
+                                                    a_id_stan, 
+                                                    b_id_stan, 
+                                                    a_won_game),
+                    gamma = games_for_elo_models$a_hfa,
+                    kfac = kfide)
+  model_steph = steph(games_for_elo_models %>% select(date, 
+                                                       a_id_stan, 
+                                                       b_id_stan, 
+                                                       a_won_game),
+                      gamma = games_for_elo_models$a_hfa)
+  PredictElo = function(model, date, a_id_stan, b_id_stan, a_hfa) {
+    return(predict(model,
+                   newdata = data.frame(date, a_id_stan, b_id_stan),
+                   gamma = a_hfa, tng = 1))
+  }
+  
+  #### * Create a Gregg Easterbrook model ####
+  #### http://www.espn.com/espn/page2/story?page=easterbrook/080212
+  #### "Last summer [2007], readers Eric Isaacson and Catey Tarbell proposed
+  #### this simple prediction algorithm: Best Record Wins; If Records Equal,
+  #### Home Team Wins. Their idea, which TMQ dubbed the Isaacson-Tarbell
+  #### Postulate, ruled the landscape of NFL predictions, finishing the season
+  #### 183-84, or 69 percent correct." This simple model encodes domain
+  #### knowledge and it's an important baseline.
+  PredictGregg = function(ahead, hfa) {
+    return(ifelse(ahead > 0, 1, # better record
+             ifelse(ahead < 0, 0, # worse record
+               ifelse(hfa > 0, 1, # home team
+                 ifelse(hfa < 0, 0, # away team
+                   # and if equal records at a neutral site:
+                   as.numeric(sample(0:1, 1))))))) # random
+  }
+  
+  #### * Create a linear model ####
+  model_glm = cv.glmnet(y = games_through_week$a_won_game,
+                        x = games_through_week %>%
+                          select(a_hfa, a_wins_prev, a_losses_prev,
+                                 b_wins_prev, b_losses_prev, 
+                                 a_games_ahead_prev) %>%
+                          as.matrix(),
+                     family = "binomial", type.measure = "deviance", 
+                     nfolds = 5)
+  PredictGLM = function(a_hfa, a_wins_prev, a_losses_prev, b_wins_prev,
+                        b_losses_prev, a_games_ahead_prev) {
+    glm_prediction = as.numeric(predict(model_glm, 
+                              newx = matrix(data = c(a_hfa, a_wins_prev, 
+                                              a_losses_prev, b_wins_prev,
+                                              b_losses_prev, 
+                                              a_games_ahead_prev), nrow = 1),
+                              type = "response", 
+                              s = "lambda.min"))
+    if (glm_prediction == 0.5) {
+      glm_prediction = as.numeric(sample(0:1, 1))
+    }
+    return(glm_prediction)
+  }
+  
+  #### * Create a random forest model ####
+  model_random_forest = randomForest(
+    y = games_through_week$a_won_game,
+    x = games_through_week %>% select(a_hfa, a_wins_prev,
+                                      a_losses_prev, b_wins_prev,
+                                      b_losses_prev,
+                                      a_games_ahead_prev) %>%
+                          as.matrix())
+  PredictRF = function(a_hfa, a_wins_prev, a_losses_prev, b_wins_prev,
+                        b_losses_prev, a_games_ahead_prev) {
+    rf_prediction = as.numeric(predict(model_random_forest, 
+                              newdata = data.frame(a_hfa, a_wins_prev, 
+                                              a_losses_prev, b_wins_prev,
+                                              b_losses_prev, 
+                                              a_games_ahead_prev),
+                              type = "response"))
+    if (rf_prediction == 0.5) {
+      rf_prediction = as.numeric(sample(0:1, 1))
+    }
+    return(rf_prediction)
+  }
+  
+  #### * Predict 1 week's upcoming games with each model ####
+  games_to_predict = games_to_predict %>%
+    rowwise() %>%
+    mutate(
+      a_mcmc_chance = ifelse(MCMC,
+                            PredictWinChance(a_id_stan, b_id_stan, a_hfa), NA),
+      a_point_spread = ifelse(MCMC,
+                              PredictPointSpread(a_id_stan, b_id_stan, a_hfa),
+                              NA),
+      a_gregg_chance = PredictGregg(a_games_ahead_prev, a_hfa),
+      a_elo_chance = PredictElo(model_elo, date, a_id_stan, b_id_stan, a_hfa),
+      a_fide_chance = PredictElo(model_fide, date, a_id_stan, b_id_stan,
+                                 a_hfa),
+      a_steph_chance = PredictElo(model_steph, date, a_id_stan,
+                                  b_id_stan, a_hfa),
+      a_glm_chance = PredictGLM(a_hfa, a_wins_prev, a_losses_prev,
+                                b_wins_prev, b_losses_prev, 
+                                a_games_ahead_prev),
+      a_rf_chance = PredictRF(a_hfa, a_wins_prev, a_losses_prev, b_wins_prev,
+                               b_losses_prev, a_games_ahead_prev)
+    )
+  all_predictions[[week]] = games_to_predict
+}
+
+#### Combine all predictions and calculate correctness
+#### Half-right for predictions of 0.5
+scored_predictions = do.call("rbind", all_predictions) %>%
+  mutate(
+    correct_mcmc = ifelse(MCMC,
+                          ifelse((a_won_game - a_mcmc_chance) < 0.5, 1, 
+                                 ifelse((a_won_game - a_mcmc_chance) == 0.5,
+                                        0.5, 0)),
+                          NA),
+    correct_elo = ifelse((a_won_game - a_elo_chance) < 0.5, 1, 
+                         ifelse((a_won_game - a_elo_chance) == 0.5, 0.5, 0)),
+    correct_fide = ifelse((a_won_game - a_fide_chance) < 0.5, 1, 
+                          ifelse((a_won_game - a_fide_chance) == 0.5, 0.5, 0)),
+    correct_steph = ifelse((a_won_game - a_steph_chance) < 0.5, 1,
+                           ifelse((a_won_game - a_steph_chance) == 0.5, 
+                                  0.5, 0)),
+    correct_gregg = ifelse((a_won_game - a_gregg_chance) < 0.5, 1,
+                           ifelse((a_won_game - a_gregg_chance) == 0.5, 
+                                  0.5, 0)),
+    correct_glm = ifelse((a_won_game - a_glm_chance) < 0.5, 1,
+                         ifelse((a_won_game - a_glm_chance) == 0.5, 0.5, 0)),
+    correct_rf = ifelse((a_won_game - a_rf_chance) < 0.5, 1,
+                        ifelse((a_won_game - a_rf_chance) == 0.5, 0.5, 0))
+  )
+# Overall performance = average correctness
+prediction_results = scored_predictions %>%
+  select(starts_with("correct")) %>%
+  colSums
+prediction_results = prediction_results / nrow(scored_predictions)
+prediction_results
+
+```
+
+```{r 4 ranking output, cache=TRUE, dependson='modeling and ranking', include=FALSE}
+# What information should appear in team rankings?
+# Certainly we want our best guess at who's number 1, 2, 3, and so on.
+# It's also helpful to give ratings to describe the distance between teams.
+# The best outcome is when those ratings have meaning within the data's 
+# domain -- e.g., points on the field or win probability -- and when we can
+# describe our uncertainty about each rating.
+
+# Using the precis() function, we can get summary information about models'
+# distributions, but not the distribution of samples themselves. If all we
+# care about is a mean and standard error of the distributions, just call
+# precis(your.fit.model, depth = 2)@output
+
+# However, we are going to use another method of ranking and rating teams.
+# MCMC (via stan and rethinking) produces samples of likely parameter values.
+# We can access those samples from a model run using the extract.samples()
+# function. We will get everything we need to simulate a game from those
+# samples: a possible strength of each team and a possible uncertainty about
+# the outcome. We will plug those values into the mathematical model that
+# rethinking and stan used, and its output will be a possible game outcome.
+# If we do that many times, we get a distribution of possible game outcomes,
+# and we can use a summary of that distribution to describe the team.
+
+# Of course we could use the precis() function and a summary of the samples
+# directly, but I choose to add an intervening step of game simulation so that
+# we can add interpretability to the model fit. We will simulate each team's
+# game against a *generic team* 1000 times for each model. That means that the
+# outcome of that simulation will be a win probability, and we can interpret
+# it by saying that "Team X wins Y% of the time against a generic team." We
+# can also add confidence intervals. "We are 95% confident that the average
+# win percentage of Team X against a generic team is between L% and H%."
+
+# What's a generic team? We have constructed our mathematical models so that
+# team strengths are offsets from zero. Therefore a generic team will have
+# a strength that is centered on zero. We should be as certain about this
+# generic team as we are about our estimations of all real teams. Therefore we
+# will get the standard error of team strengths for the real teams, then use 
+# the mean of those standard errors as the standard error for our generic team.
+
+#### Rank using regression model ####
+samples_score_margin = extract.samples(model_a_score_margin)
+mean_team_deviation_score_margin = samples_score_margin$team %>%
+  apply(2, sd) %>%
+  mean()
+
+# Simulate games against a generic opponent.
+gathered_score_margin = as.data.frame(samples_score_margin$team) %>%
+  # Gather into a long format: teams are row values instead of column names
+  gather(team, this_team_sampled_strength)
+# I prefer 10,000 simulations per team instead of 1,000
+reps_needed = floor(SAMPLE_COUNT / (nrow(gathered_score_margin) / 32))
+simulation_score_margin = do.call("rbind", replicate(reps_needed,
+                                                     gathered_score_margin,
+                                                     simplify = FALSE)) %>%
+  mutate(
+    # Get sigma & noise values from the Stan samples but randomly reorder
+    sigma = base::sample(rep(samples_score_margin$sigma_a_score_margin, 
+                             32 * reps_needed)),
+    noise = base::sample(rep(samples_score_margin$noise, 
+                             32 * reps_needed)),
+    # Pretend each sampled team strength is a game and generate a new opponent
+    # for that row. That new opponent is a generic opponent with mean strength
+    # of 0 and deviation equal to the mean of all teams.
+    opponent_sampled_strength = rnorm(length(this_team_sampled_strength),
+                                      mean = 0,
+                                      sd = mean_team_deviation_score_margin),
+    # Now simulate a game based on the two teams' sampled strengths.
+    simulated_spread = mapply(rnorm, 
+                              n = 1,
+                              mean = noise + 
+                                this_team_sampled_strength - 
+                                opponent_sampled_strength,
+                              sd = sigma),
+    this_team_won_simulation = ifelse(simulated_spread > 0, 1, 0)
+  )
+ranking_score_margin = simulation_score_margin %>%
+  group_by(team) %>%
+  summarize(
+    score_margin_simulation_mean = mean(simulated_spread),
+    score_margin_simulation_standard_error = sqrt(var(simulated_spread) / 
+                                                  length(simulated_spread)),
+    score_margin_win_probability_mean = mean(this_team_won_simulation),
+    score_margin_win_probability_standard_error = sqrt(
+      var(this_team_won_simulation) / length(this_team_won_simulation))
+  ) %>%
+  mutate(
+    score_margin_simulation_rank = min_rank(
+      desc(score_margin_simulation_mean)),
+    score_margin_win_probability_rank = min_rank(
+      desc(score_margin_win_probability_mean)),
+    teamNumber = as.numeric(gsub("[^0-9]", "", team))
+  ) %>%
+  left_join(stan_massey_id_crosswalk, by = c("teamNumber" = "id_stan")) %>%
+  select(-teamNumber, -team) %>%
+  left_join(teams, by = "id_massey") %>%
+  left_join(records, by = "id_massey")
+
+#### Rank using classification model ####
+samples_won_game = extract.samples(model_a_won_game)
+mean_team_deviation_won_game = samples_won_game$team %>%
+  apply(2, sd) %>%
+  mean()
+
+# Simulate games against a generic opponent.
+gathered_won_game = as.data.frame(samples_won_game$team) %>%
+  # Gather into a long format: teams are row values instead of column names
+  gather(team, this_team_sampled_strength)
+# I prefer 10,000 simulations per team instead of 1,000
+reps_needed = floor(SAMPLE_COUNT / (nrow(gathered_won_game) / 32))
+simulation_won_game = do.call("rbind", replicate(reps_needed,
+                                                 gathered_won_game,
+                                                 simplify = FALSE)) %>%
+  mutate(
+    # Get noise values from the Stan samples but randomly reorder
+    noise = base::sample(rep(samples_won_game$noise, 32 * reps_needed)),
+    # Pretend each sampled team strength is a game and generate a new opponent
+    # for that row. That new opponent is a generic opponent with mean strength
+    # of 0 and deviation equal to the mean of all teams.
+    opponent_sampled_strength = rnorm(length(this_team_sampled_strength),
+                                      mean = 0,
+                                      sd = mean_team_deviation_won_game),
+    # Now simulate a game based on the two teams' sampled strengths.
+    simulated_spread = mapply(rbinom, 
+                              n = 1,
+                              prob = exp(noise + 
+                                this_team_sampled_strength - 
+                                opponent_sampled_strength) / 
+                                (1 + exp(noise + 
+                                this_team_sampled_strength - 
+                                opponent_sampled_strength)),
+                              size = 1),
+    this_team_won_simulation = ifelse(simulated_spread > 0, 1, 0)
+  )
+ranking_won_game = simulation_won_game %>%
+  group_by(team) %>%
+  summarize(
+    won_game_win_probability_mean = mean(this_team_won_simulation),
+    won_game_win_probability_standard_error = sqrt(
+      var(this_team_won_simulation) / length(this_team_won_simulation))
+  ) %>%
+  mutate(
+    won_game_win_probability_rank = min_rank(
+      desc(won_game_win_probability_mean)),
+    teamNumber = as.numeric(gsub("[^0-9]", "", team))
+  ) %>%
+  left_join(stan_massey_id_crosswalk, by = c("teamNumber" = "id_stan")) %>%
+  select(-teamNumber, -team) %>%
+  left_join(teams, by = "id_massey") %>%
+  left_join(records, by = "id_massey")
+
+#### Combine rankings ####
+ranking_overall = ranking_won_game %>%
+  full_join(ranking_score_margin, 
+            by = c("id_massey", "team", "wins", "losses")) %>%
+  select(team, wins, losses,
+         won_game_win_probability_rank,
+         won_game_win_probability_mean,
+         score_margin_simulation_rank,
+         score_margin_simulation_mean) %>%
+  mutate(
+    close_game_luck = score_margin_simulation_rank - 
+      won_game_win_probability_rank,
+    close_game_luck_rank = min_rank(desc(close_game_luck))
+  )
+
+# Join rankings and order by the average ranking, but don't actually show
+# the average ranking to the user, since that's not statistically
+# meaningful.
+ranking_for_viewing = ranking_overall %>%
+  rename(Team = team, Wins = wins, Losses = losses,
+        `Win Probability v. Generic Team` = won_game_win_probability_mean,
+        `Win Probability Rank` = won_game_win_probability_rank, 
+        `Point Margin v. Generic Team` = score_margin_simulation_mean,
+        `Point Margin Rank` = score_margin_simulation_rank,
+        `Close Game Luck` = close_game_luck,
+        `Close Game Luck Rank` = close_game_luck_rank) %>%
+  mutate(
+    `Win Probability v. Generic Team` = 
+      round(`Win Probability v. Generic Team`, 3),
+    `Point Margin v. Generic Team` = 
+      round(`Point Margin v. Generic Team`, 2),
+    for_ranking = (`Win Probability Rank` + `Point Margin Rank`) / 2
+  ) %>%
+  arrange(for_ranking) %>%
+  select(-for_ranking)
+
+```
+
+<!-- # NFL Rankings -->
+<!-- #### `r format(Sys.time(), '%B %d, %Y')` -->
+
+```{r 5 print rankings, echo=FALSE, dependson='ranking output', results="asis"}
+kable(ranking_for_viewing, align = 'c')
+```
+
+
+```{r 6 predictions, cache=TRUE, include=FALSE}
+#### Transform data for MCMC ####
+upcoming_games = data.frame(plaintext =
+  c("Seattle at Atlanta",
+    "Houston at New England",
+    "Pittsburgh at Kansas City",
+    "Green Bay at Dallas")) %>%
+  separate(plaintext, c("visitor_team","home_team"), " at ") %>%
+  left_join(teams %>% mutate(team = trimws(team)),
+            by = c("home_team" = "team")) %>%
+  rename(a_id_massey = id_massey) %>%
+  left_join(teams %>% mutate(team = trimws(team)),
+            by = c("visitor_team" = "team")) %>%
+  rename(b_id_massey = id_massey) %>%
+  mutate(
+    a_hfa = 1
+  ) %>%
+  left_join(stan_massey_id_crosswalk, by = c("a_id_massey" = "id_massey")) %>%
+  rename(a_id_stan = id_stan) %>%
+  left_join(stan_massey_id_crosswalk, by = c("b_id_massey" = "id_massey")) %>%
+  rename(b_id_stan = id_stan) %>%
+  mutate(
+    a_id_stan = as.integer(a_id_stan),
+    b_id_stan = as.integer(b_id_stan)
+  )
+
+PredictWinChance = function(a_id_stan, b_id_stan, a_hfa) {
+  return(mean(sim(fit = model_a_won_game, n = SAMPLE_COUNT,
+                  data = data_frame(a_id_stan = a_id_stan,
+                                    b_id_stan = b_id_stan,
+                                    a_hfa = a_hfa))))
+}
+PredictPointSpread = function(a_id_stan, b_id_stan, a_hfa) {
+  return(mean(sim(fit = model_a_score_margin, n = SAMPLE_COUNT,
+                  data = data_frame(a_id_stan = a_id_stan,
+                                    b_id_stan = b_id_stan,
+                                    a_hfa = a_hfa))))
+}
+
+#### Simulate games ####
+predictions = upcoming_games %>%
+  rowwise() %>%
+  mutate(
+    home_win_chance = PredictWinChance(a_id_stan, b_id_stan, a_hfa),
+    home_point_spread = round(PredictPointSpread(a_id_stan, b_id_stan, 
+                                                 a_hfa), 1),
+    prediction = ifelse(home_point_spread > 0.5,
+                  paste(home_team, " ", round(home_win_chance * 100, 1), "%",
+                        sep = ""),
+                  paste(visitor_team, " ", 100 - round(home_win_chance * 100,
+                                                       1), "%", sep = "")),
+    line = ifelse(home_point_spread > 0,
+                  paste(home_team, round(home_point_spread,1) * -1),
+                  paste(visitor_team, round(home_point_spread,1)))
+  ) %>%
+  select(
+    Home = home_team,
+    Visitor = visitor_team,
+    Prediction = prediction, 
+    Line = line,
+    a_id_stan, b_id_stan, a_hfa
+  )
+
+#### Print game lines ####
+kable(predictions %>% select(Home, Visitor, Prediction, Line), align = 'c')
+
+#### Probability distribution charts ####
+by(upcoming_games, 1:nrow(upcoming_games), function(row) {
+  ggplot() +
+    geom_histogram(data = as.data.frame(x = sim(fit = model_a_score_margin, 
+                                                  n = SAMPLE_COUNT,
+                                data = data_frame(a_id_stan = row$a_id_stan,
+                                                  b_id_stan = row$b_id_stan,
+                                                  a_hfa = 1))),
+                     aes(x = V1),
+                     binwidth = 1) +
+    ylab("Number of Simulations") +
+    xlab(paste("Predicted", row$home_team, "Margin of Victory")) +
+    ggtitle(paste(row$visitor_team, "at", row$home_team)) +
+    theme_economist() +
+    ggsave(filename = paste(row$visitor_team, "-at-", row$home_team,
+                            ".png", sep = ""))
+})
+
+```
+
+
+# Description
+
+The Jarratt NFL Rankings are a combination of two statistical models. Both models attempt to best explain each National Football League game result using several explanatory factors. One model explains wins and losses. The other model explains points on the court, specifically margin of victory and defeat.
+
+The explanatory factors are:
+
+* home advantage
+* individual team strengths
+
+Both models use the same data; only the representation of the outcome changes. To estimate home advantage, division advantage, and individual team strengths, the Jarratt Rankings use Markov Chain Monte Carlo sampling via Stan in R through the [rethinking R package by Richard McElreath](http://xcelab.net/rm/statistical-rethinking/).
+
+The posterior distribution that MCMC sampling returns is used to simulate 20,000 games per team against a generic team, half using each model described above. This generic team's strength is set at the league average, and the uncertainty about its strength is set to the average of all teams' uncertainty (i.e., the standard deviations of their posterior distributions).
+
+The Close Game Luck is the difference between a team's Win Probability Rank and its Point Margin Rank. If a team wins more often than their expected point spread indicates, then that team makes more efficient use of their points or is lucky in close games.
+
+Last updated `r format(Sys.time(), '%B %d, %Y')`.
